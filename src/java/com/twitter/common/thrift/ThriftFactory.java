@@ -23,6 +23,7 @@ import java.net.InetSocketAddress;
 import java.util.Collection;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.SynchronousQueue;
@@ -161,10 +162,21 @@ public class ThriftFactory<T> {
    * @return A new thrift client.
    */
   public Thrift<T> build(Set<InetSocketAddress> backends) {
+    return build(backends, new SynchronousQueue<Runnable>());
+  }
+
+  /**
+   * Creates the thrift client with a given task queue, and initializes connection pools.
+   *
+   * @param backends Backends to connect to.
+   * @param taskQueue Queue to use when communicating with worker threads.
+   * @return A new thrift client.
+   */
+  public Thrift<T> build(Set<InetSocketAddress> backends, BlockingQueue<Runnable> taskQueue) {
     checkBaseState();
     MorePreconditions.checkNotBlank(backends);
 
-    ManagedThreadPool managedThreadPool = createManagedThreadpool(backends.size());
+    ManagedThreadPool managedThreadPool = createManagedThreadpool(backends.size(), taskQueue);
     LoadBalancer<InetSocketAddress> loadBalancer = createLoadBalancer();
     Function<TTransport, T> clientFactory = getClientFactory();
 
@@ -177,16 +189,32 @@ public class ThriftFactory<T> {
 
   /**
    * Creates a synchronous thrift client that will communicate with a dynamic host set.
+   * Task will be rejected in case no worker thread is present when submitting the task.
    *
    * @param hostSet The host set to use as a backend.
    * @return A thrift client.
    * @throws ThriftFactoryException If an error occurred while creating the client.
    */
   public Thrift<T> build(DynamicHostSet<ServiceInstance> hostSet) throws ThriftFactoryException {
+    return build(hostSet, new SynchronousQueue<Runnable>());
+  }
+
+  /**
+   * Creates a synchronous thrift client that will communicate with a dynamic host set and
+   * queue pending task on the given queue.
+   *
+   * The queue decides behaviour when submitting tasks.
+   *
+   * @param hostSet The host set to use as a backend.
+   * @param taskQueue Queue to use when communicating with worker threads.
+   * @return A thrift client.
+   * @throws ThriftFactoryException If an error occurred while creating the client
+   */
+  public Thrift<T> build(DynamicHostSet<ServiceInstance> hostSet, BlockingQueue<Runnable> taskQueue) throws ThriftFactoryException {
     checkBaseState();
     Preconditions.checkNotNull(hostSet);
 
-    ManagedThreadPool managedThreadPool = createManagedThreadpool(1);
+    ManagedThreadPool managedThreadPool = createManagedThreadpool(1, taskQueue);
     LoadBalancer<InetSocketAddress> loadBalancer = createLoadBalancer();
     Function<TTransport, T> clientFactory = getClientFactory();
 
@@ -197,8 +225,8 @@ public class ThriftFactory<T> {
         serviceInterface, clientFactory, false, sslTransport);
   }
 
-  private ManagedThreadPool createManagedThreadpool(int initialEndpointCount) {
-    return new ManagedThreadPool(serviceName, initialEndpointCount, maxConnectionsPerEndpoint);
+  private ManagedThreadPool createManagedThreadpool(int initialEndpointCount, BlockingQueue<Runnable> taskQueue) {
+    return new ManagedThreadPool(serviceName, initialEndpointCount, maxConnectionsPerEndpoint, taskQueue);
   }
 
   /**
@@ -211,22 +239,23 @@ public class ThriftFactory<T> {
 
     private static final Logger LOG = Logger.getLogger(ManagedThreadPool.class.getName());
 
-    private static ThreadPoolExecutor createThreadPool(String serviceName, int initialSize) {
+    private static ThreadPoolExecutor createThreadPool(String serviceName, int initialSize,
+        BlockingQueue<Runnable> taskQueue) {
       ThreadFactory threadFactory =
           new ThreadFactoryBuilder()
               .setNameFormat("Thrift[" +serviceName + "][%d]")
               .setDaemon(true)
               .build();
       return new ThreadPoolExecutor(initialSize, initialSize, 0, TimeUnit.MILLISECONDS,
-          new SynchronousQueue<Runnable>(), threadFactory);
+              taskQueue, threadFactory);
     }
 
     private final int maxConnectionsPerEndpoint;
 
     public ManagedThreadPool(String serviceName, int initialEndpointCount,
-        int maxConnectionsPerEndpoint) {
+        int maxConnectionsPerEndpoint, BlockingQueue<Runnable> taskQueue) {
 
-      super(createThreadPool(serviceName, initialEndpointCount * maxConnectionsPerEndpoint));
+      super(createThreadPool(serviceName, initialEndpointCount * maxConnectionsPerEndpoint, taskQueue));
       this.maxConnectionsPerEndpoint = maxConnectionsPerEndpoint;
       setRejectedExecutionHandler(initialEndpointCount);
     }

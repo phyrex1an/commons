@@ -24,7 +24,11 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
@@ -34,6 +38,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.testing.TearDown;
 import com.google.common.testing.junit4.TearDownTestCase;
 
+import org.apache.thrift.TException;
 import org.apache.thrift.async.AsyncMethodCallback;
 import org.apache.thrift.async.TAsyncClient;
 import org.apache.thrift.async.TAsyncClientManager;
@@ -104,6 +109,30 @@ public class ThriftFactoryTest extends TearDownTestCase {
     public static class Client implements Iface {
       @Override public void doWork() {
         throw new UnsupportedOperationException();
+      }
+    }
+  }
+
+  static class BlockingService {
+    public static Semaphore workStopper = new Semaphore(0);
+    public interface Iface {
+      String doWork() throws TException;
+    }
+
+    public static final String DONE = "done";
+
+    public static class Client implements Iface {
+      public Client(TProtocol protocol) {
+        assertNotNull(protocol);
+      }
+
+      @Override public String doWork() throws TException {
+        try {
+          workStopper.tryAcquire(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+        return DONE;
       }
     }
   }
@@ -241,5 +270,92 @@ public class ThriftFactoryTest extends TearDownTestCase {
     assertTrue("wasn't called back in time, callback got " + responseHolder[0],
         done.await(5000, TimeUnit.MILLISECONDS));
     assertEquals(GoodService.DONE, responseHolder[0]);
+  }
+
+  private void asyncTask(final BlockingQueue<TException> exception, final CountDownLatch clientDone,
+      final BlockingService.Iface client) {
+    Thread asyncClient = new Thread(new Runnable() {
+      @Override public void run() {
+        try {
+          client.doWork();
+        } catch (TException e) {
+          try {
+            exception.put(e);
+          } catch (InterruptedException e1) {
+            // We are done here.
+          }
+        } finally {
+          clientDone.countDown();
+        }
+      }
+    });
+    asyncClient.setDaemon(true);
+    asyncClient.start();
+  }
+
+  @Test
+  public void testConnectWhileBlocking() throws Exception {
+    final ServerSocket server = new ServerSocket(0);
+    try {
+      final Thrift<BlockingService.Iface> thrift = ThriftFactory.create(BlockingService.Iface.class)
+          .withMaxConnectionsPerEndpoint(1)
+          .build(ImmutableSet.of(new InetSocketAddress(server.getLocalPort())));
+      addTearDown(new TearDown() {
+        @Override public void tearDown() {
+          thrift.close();
+        }
+      });
+
+      final BlockingService.Iface client = thrift.create();
+
+      final BlockingQueue<TException> exceptions =  new LinkedBlockingQueue<TException>();
+      final CountDownLatch clientDone = new CountDownLatch(2);
+
+      asyncTask(exceptions, clientDone, client);
+      asyncTask(exceptions, clientDone, client);
+
+      // We expect one resource exhausted exception when trying to start one new task while all workers are blocking
+      assertTrue(exceptions.poll(1, TimeUnit.SECONDS) instanceof TResourceExhaustedException);
+      BlockingService.workStopper.release();
+      clientDone.await();
+      assertTrue(exceptions.isEmpty());
+    } finally {
+      server.close();
+      BlockingService.workStopper.drainPermits();
+    }
+  }
+
+  @Test
+  public void testBoundedQueueing() throws Exception {
+    final ServerSocket server = new ServerSocket(0);
+    try {
+      final Thrift<BlockingService.Iface> thrift = ThriftFactory.create(BlockingService.Iface.class)
+          .withMaxConnectionsPerEndpoint(1)
+          .build(ImmutableSet.of(new InetSocketAddress(server.getLocalPort())), new ArrayBlockingQueue<Runnable>(1));
+      addTearDown(new TearDown() {
+        @Override public void tearDown() {
+          thrift.close();
+        }
+      });
+
+      final BlockingService.Iface client = thrift.create();
+
+      final BlockingQueue<TException> exceptions =  new LinkedBlockingQueue<TException>();
+      final CountDownLatch clientDone = new CountDownLatch(3);
+
+      asyncTask(exceptions, clientDone, client);
+      asyncTask(exceptions, clientDone, client);
+      asyncTask(exceptions, clientDone, client);
+
+      // When using a bounded queue, we expect only the task exceeding the queue lenght to fail.
+      assertTrue(exceptions.poll(1, TimeUnit.SECONDS) instanceof TResourceExhaustedException);
+      BlockingService.workStopper.release();
+      BlockingService.workStopper.release();
+      clientDone.await();
+      assertTrue(exceptions.isEmpty());
+    } finally {
+      server.close();
+      BlockingService.workStopper.drainPermits();
+    }
   }
 }
